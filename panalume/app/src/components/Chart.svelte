@@ -25,9 +25,10 @@
     for (const [t, v] of points) {
       if (t < start) { pts[0] = [0, Y(v)]; continue; }
       const x = X(t);
+      // Measure the 2px from the last kept point; moving lastX on every
+      // replaced point would fold a fast sensor's whole history into one point.
       if (x - lastX < 2 && pts.length) pts[pts.length - 1] = [x, Y(v)];
-      else pts.push([x, Y(v)]);
-      lastX = x;
+      else { pts.push([x, Y(v)]); lastX = x; }
     }
     if (pts.length === 1) pts.push([w, pts[0][1]]);
     if (!pts.length) return '';
