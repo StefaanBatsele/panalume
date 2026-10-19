@@ -29,6 +29,7 @@
     }),
     fields: [
       { key: 'name', label: 'Title', type: 'text' },
+      { key: 'period', label: 'Show', type: 'select', options: [{ value: 'now', label: 'Power right now' }, { value: 'today', label: 'Energy today (from HA Energy settings)' }, { value: 'yesterday', label: 'Energy yesterday (from HA Energy settings)' }] },
       { key: 'solar', label: 'Solar power', type: 'entity', domain: 'sensor' },
       { key: 'home', label: 'House power (blank = worked out)', type: 'entity', domain: 'sensor' },
       { key: 'grid', label: 'Grid power, one sensor (+import / −export)', type: 'entity', domain: 'sensor', section: 'grid' },
@@ -53,11 +54,81 @@
   // Where the house's power is coming from and going to right now: solar,
   // battery and house figures, and a flow chart whose bands are as thick as
   // the power on each route (solar → house, solar → battery, battery → house…).
+  // With period today / yesterday it shows the energy (kWh) instead, worked out
+  // from the statistics of the sources in HA's Energy settings.
   import { untrack } from 'svelte';
   import Icon from '../components/Icon.svelte';
   import { t, ent } from '../lib/tpl.js';
+  import { send, conn } from '../lib/ha.svelte.js';
   let { props, w = 460, h = 320 } = $props();
   const show = (k) => !props.hide?.[k];
+  const pos = (v) => Math.max(0, v ?? 0);
+
+  // Route split for one moment (W) or one interval (Wh): solar feeds the house
+  // first, then the battery, then export; the battery covers the rest of the
+  // house; the grid makes up anything left.
+  const split = (solar, imp, exp, dis, charge, house) => {
+    const sh = Math.min(solar, house), sb = Math.min(solar - sh, charge), sg = Math.min(pos(solar - sh - sb), exp);
+    const bh = Math.min(dis, pos(house - sh)), bg = Math.min(pos(dis - bh), pos(exp - sg));
+    return { sh, sb, sg, bh, bg, gh: Math.min(imp, pos(house - sh - bh)), gb: Math.min(pos(imp - (house - sh - bh)), pos(charge - sb)) };
+  };
+
+  const period = $derived(props.period === 'today' || props.period === 'yesterday' ? props.period : 'now');
+  let prefs = $state(null), stats = $state(null), statsErr = $state('');
+  const statIds = $derived.by(() => {
+    const out = { from: [], to: [], solar: [], bout: [], bin: [] };
+    for (const s of prefs?.energy_sources || []) {
+      if (s.type === 'grid') {
+        if (s.stat_energy_from) out.from.push(s.stat_energy_from);
+        if (s.stat_energy_to) out.to.push(s.stat_energy_to);
+        for (const f of s.flow_from || []) out.from.push(f.stat_energy_from);
+        for (const f of s.flow_to || []) out.to.push(f.stat_energy_to);
+      } else if (s.type === 'solar') out.solar.push(s.stat_energy_from);
+      else if (s.type === 'battery') { out.bout.push(s.stat_energy_from); out.bin.push(s.stat_energy_to); }
+    }
+    return out;
+  });
+  async function loadStats() {
+    if (period === 'now' || !conn.connected) return;
+    try {
+      prefs ??= await send({ type: 'energy/get_prefs' });
+      const all = Object.values(statIds).flat().filter(Boolean);
+      if (!all.length) return void (statsErr = 'No energy sources set up in Home Assistant (Settings → Dashboards → Energy).');
+      const d = new Date(); d.setHours(0, 0, 0, 0);
+      const start = d.getTime() - (period === 'yesterday' ? 864e5 : 0);
+      stats = await send({
+        type: 'recorder/statistics_during_period', start_time: new Date(start).toISOString(), end_time: new Date(start + 864e5).toISOString(),
+        period: period === 'yesterday' ? 'hour' : '5minute', statistic_ids: all, types: ['change'], units: { energy: 'kWh' },
+      });
+      statsErr = '';
+    } catch (e) {
+      statsErr = e?.message || 'Could not read energy statistics';
+    }
+  }
+  $effect(() => {
+    period; conn.connected;
+    if (period === 'now') return;
+    untrack(loadStats);
+    const a = setInterval(loadStats, 60e3);
+    return () => clearInterval(a);
+  });
+  // Day totals in Wh: each interval split into routes, then added up.
+  const day = $derived.by(() => {
+    if (period === 'now' || !stats) return null;
+    const slots = new Map();
+    for (const [k, list] of Object.entries(statIds)) for (const id of list) for (const r of stats[id] || []) {
+      const s = slots.get(r.start) ?? { from: 0, to: 0, solar: 0, bout: 0, bin: 0 };
+      if (r.change > 0) s[k] += r.change * 1000;
+      slots.set(r.start, s);
+    }
+    const tot = { from: 0, to: 0, solar: 0, bout: 0, bin: 0 }, routes = { sh: 0, sb: 0, sg: 0, bh: 0, bg: 0, gh: 0, gb: 0 };
+    for (const x of slots.values()) {
+      for (const k in tot) tot[k] += x[k];
+      const r = split(x.solar, x.from, x.to, x.bout, x.bin, pos(x.solar + x.from + x.bout - x.to - x.bin));
+      for (const k in routes) routes[k] += r[k];
+    }
+    return { tot, routes, grid: statIds.from.length + statIds.to.length > 0, batt: statIds.bout.length > 0 };
+  });
 
   const read = (id) => {
     const e = ent(id);
@@ -83,22 +154,22 @@
   });
   $effect(() => () => clearTimeout(timer));
   const watts = (id) => (settled && id in settled ? settled[id] : read(id));
-  const pos = (v) => Math.max(0, v ?? 0);
 
-  const hasGrid = $derived(show('grid') && !!(props.grid || props.grid_import || props.grid_export || props.grid_home));
-  const hasBatt = $derived(show('battery') && !!(props.battery || props.battery_soc || props.solar_battery || props.battery_home));
+  const hasGrid = $derived(show('grid') && (day ? day.grid : !!(props.grid || props.grid_import || props.grid_export || props.grid_home)));
+  const hasBatt = $derived(show('battery') && (day ? day.batt : !!(props.battery || props.battery_soc || props.solar_battery || props.battery_home)));
 
   // Totals: + grid = importing, + battery = discharging.
-  const solar = $derived(pos(watts(props.solar)));
-  const grid = $derived(props.grid ? (watts(props.grid) ?? 0) * (props.grid_invert ? -1 : 1) : pos(watts(props.grid_import)) - pos(watts(props.grid_export)));
+  const solar = $derived(day ? day.tot.solar : pos(watts(props.solar)));
+  const grid = $derived(day ? day.tot.from - day.tot.to : props.grid ? (watts(props.grid) ?? 0) * (props.grid_invert ? -1 : 1) : pos(watts(props.grid_import)) - pos(watts(props.grid_export)));
   // SolarEdge reports battery DC power as + charging, so the fallback is inverted.
   const autoBatt = $derived(props.battery ? '' : SE_BATT.find((id) => ent(id)) || '');
-  const batt = $derived(props.battery ? (watts(props.battery) ?? 0) * (props.battery_invert ? -1 : 1) : autoBatt ? -(watts(autoBatt) ?? 0) : null);
+  const batt = $derived(day ? (day.batt ? day.tot.bout - day.tot.bin : null) : props.battery ? (watts(props.battery) ?? 0) * (props.battery_invert ? -1 : 1) : autoBatt ? -(watts(autoBatt) ?? 0) : null);
 
   // Each route: its own sensor where there is one, otherwise worked out —
   // solar feeds the house first, then the battery, then export; the battery
   // covers the rest of the house; the grid makes up anything left.
   const routes = $derived.by(() => {
+    if (day) return day.routes;
     const given = { sh: props.solar_home, sb: props.solar_battery, sg: props.solar_grid, bh: props.battery_home, bg: props.battery_grid, gh: props.grid_home, gb: props.grid_battery };
     if (Object.values(given).some(Boolean)) {
       const r = Object.fromEntries(Object.entries(given).map(([k, id]) => [k, pos(watts(id))]));
@@ -118,22 +189,20 @@
       }
       return r;
     }
-    const b = batt ?? 0, charge = pos(-b), dis = pos(b), imp = pos(grid), exp = pos(-grid);
-    const house = props.home ? pos(watts(props.home)) : pos(solar + grid + b);
-    const sh = Math.min(solar, house), sb = Math.min(solar - sh, charge), sg = Math.min(pos(solar - sh - sb), exp);
-    const bh = Math.min(dis, pos(house - sh)), bg = Math.min(pos(dis - bh), pos(exp - sg));
-    return { sh, sb, sg, bh, bg, gh: Math.min(imp, pos(house - sh - bh)), gb: Math.min(pos(imp - (house - sh - bh)), pos(charge - sb)) };
+    const b = batt ?? 0;
+    return split(solar, pos(grid), pos(-grid), pos(b), pos(-b), props.home ? pos(watts(props.home)) : pos(solar + grid + b));
   });
-  const house = $derived(props.home ? pos(watts(props.home)) : routes.sh + routes.bh + routes.gh);
+  const house = $derived(!day && props.home ? pos(watts(props.home)) : routes.sh + routes.bh + routes.gh);
   const battNet = $derived(batt ?? routes.bh + routes.bg - routes.sb - routes.gb);
-  const gridNet = $derived(props.grid || props.grid_import || props.grid_export ? grid : routes.gh + routes.gb - routes.sg - routes.bg);
+  const gridNet = $derived(day || props.grid || props.grid_import || props.grid_export ? grid : routes.gh + routes.gb - routes.sg - routes.bg);
   const soc = $derived(Number(ent(props.battery_soc)?.state));
   // Share of the house's power that isn't coming from the grid.
   const selfPct = $derived(house > 20 ? Math.round(((routes.sh + routes.bh) / Math.max(house, routes.sh + routes.bh + routes.gh)) * 100) : null);
 
   const C = { solar: '#ffc247', batt: '#5bd88f', grid: '#9aa9c4', house: '#7aa2ff', exp: '#c792ff' };
-  const fmt = (v) => (v == null ? '—' : Math.abs(v) >= 1000 ? (Math.abs(v) / 1000).toFixed(Math.abs(v) >= 10000 ? 0 : 2) : String(Math.round(Math.abs(v))));
-  const u = (v) => (v != null && Math.abs(v) >= 1000 ? 'kW' : 'W');
+  // Day totals are in Wh, so they keep a decimal above 10 kWh.
+  const fmt = (v) => (v == null ? '—' : Math.abs(v) >= 1000 ? (Math.abs(v) / 1000).toFixed(Math.abs(v) >= 10000 ? (day ? 1 : 0) : 2) : String(Math.round(Math.abs(v))));
+  const u = (v) => (v != null && Math.abs(v) >= 1000 ? 'kW' : 'W') + (day ? 'h' : '');
   const kfmt = (v) => `${fmt(v)} ${u(v)}`;
   const IDLE = 15;
 
@@ -216,15 +285,21 @@
       {#if hasBatt}
         <div class="tile" style="--c:{C.batt}">
           <small><Icon icon={battNet < -IDLE ? 'mdi:battery-charging' : 'mdi:home-battery'} size="1.1em" />Battery{#if Number.isFinite(soc)}<span class="soc">{Math.round(soc)}%</span>{/if}</small>
-          <b class:off={Math.abs(battNet) <= IDLE}>{Math.abs(battNet) <= IDLE ? 'Idle' : fmt(battNet)}{#if Math.abs(battNet) > IDLE}<i>{u(battNet)}</i>{/if}</b>
-          {#if !strip}<em>{battNet < -IDLE ? 'charging' : battNet > IDLE ? 'discharging' : Number.isFinite(soc) ? 'holding' : ''}</em>{/if}
+          {#if day}
+            <b class:off={day.tot.bin <= IDLE}>{fmt(day.tot.bin)}<i>{u(day.tot.bin)}</i></b>
+            {#if !strip}<em>charged · {kfmt(day.tot.bout)} out</em>{/if}
+          {:else}
+            <b class:off={Math.abs(battNet) <= IDLE}>{Math.abs(battNet) <= IDLE ? 'Idle' : fmt(battNet)}{#if Math.abs(battNet) > IDLE}<i>{u(battNet)}</i>{/if}</b>
+            {#if !strip}<em>{battNet < -IDLE ? 'charging' : battNet > IDLE ? 'discharging' : Number.isFinite(soc) ? 'holding' : ''}</em>{/if}
+          {/if}
           {#if Number.isFinite(soc) && !strip}<div class="lvl"><span style="width:{Math.min(100, soc)}%"></span></div>{/if}
         </div>
       {/if}
       <div class="tile" style="--c:{C.house}">
         <small><Icon icon="mdi:home" size="1.1em" />House</small>
         <b>{fmt(house)}<i>{u(house)}</i></b>
-        {#if hasGrid && !strip}<em class:exp={gridNet < -IDLE}>{gridNet < -IDLE ? `exporting ${kfmt(gridNet)}` : gridNet > IDLE ? `${kfmt(gridNet)} from grid` : 'nothing from grid'}</em>{/if}
+        {#if hasGrid && !strip && day}<em>{kfmt(day.tot.from)} from grid{#if day.tot.to > IDLE}{' · '}{kfmt(day.tot.to)} exported{/if}</em>
+        {:else if hasGrid && !strip}<em class:exp={gridNet < -IDLE}>{gridNet < -IDLE ? `exporting ${kfmt(gridNet)}` : gridNet > IDLE ? `${kfmt(gridNet)} from grid` : 'nothing from grid'}</em>{/if}
       </div>
     </div>
   {/if}
@@ -252,7 +327,7 @@
           {#each chart.R as n}<text x={cw - BAR - 7} y={n.ly} dominant-baseline="middle" text-anchor="end" class="nl">{n.label} <tspan>{kfmt(n.v)}</tspan></text>{/each}
         </svg>
       {:else}
-        <div class="none">Nothing flowing right now</div>
+        <div class="none">{period === 'now' ? 'Nothing flowing right now' : statsErr || (stats ? 'No energy used yet' : 'Loading…')}</div>
       {/if}
     </div>
   {/if}
