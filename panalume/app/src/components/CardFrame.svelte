@@ -9,6 +9,9 @@
 
   let { card, w, h, editing = false, inPopup = false } = $props();
   const def = $derived(cards[card.type]);
+  // Templates are rendered by HA through a subscription that starts on first
+  // use; read a service action's data now so it's ready on the first tap.
+  $effect(() => { for (const a of [card.tap, card.hold]) if (a?.action === 'service' && a.data) t(a.data); });
   const s = $derived(card.style || {});
   const vars = $derived({ entity_id: card.props?.entity });
   // Content size: dashboard-wide card size × this card's own size (both %).
