@@ -1,7 +1,16 @@
 <script module>
+  // One button per line: "target | name | icon | popup title".
+  export const parseButtons = (text) => String(text || '').split('\n').map((line) => line.split('|').map((s) => s.trim())).filter(([target]) => target).map(([target, name, icon, title]) => {
+    const popup = target.match(/^popup\s*:\s*(.*)$/i);
+    return popup
+      ? { popup: popup[1].split(',').map((s) => s.trim()).filter(Boolean), name, icon, title }
+      : { entity: target, name, icon };
+  });
   export const meta = {
     type: 'room', name: 'Room', icon: 'mdi:sofa', category: 'Controls',
     size: { w: 450, h: 240 }, tap: 'none', hold: 'none',
+    // The button entities sit inside one text setting, so name them for the state subscription.
+    watch: (p) => parseButtons(p.buttons).map((b) => b.entity).filter(Boolean),
     defaults: { name: 'Room', buttons: '', language: 'en' },
     fields: [
       { key: 'name', label: 'Name', type: 'text' },
@@ -28,19 +37,14 @@
   import Icon from '../components/Icon.svelte';
   import { t, ent } from '../lib/tpl.js';
   import { isActive, toggle, entityIcon, formatNumber, stateText } from '../lib/entity.js';
-  import { send, conn, haImage } from '../lib/ha.svelte.js';
+  import { send, conn, haImage, callService } from '../lib/ha.svelte.js';
   import { app } from '../lib/config.svelte.js';
   let { props, w = 450 } = $props();
 
   const TXT = { en: { none: 'All off', on: (n) => `${n} on` }, nl: { none: 'Alles uit', on: (n) => `${n} aan` } };
   const L = $derived(TXT[props.language] || TXT.en);
 
-  const buttons = $derived(String(props.buttons || '').split('\n').map((line) => line.split('|').map((s) => s.trim())).filter(([target]) => target).map(([target, name, icon, title]) => {
-    const popup = target.match(/^popup\s*:\s*(.*)$/i);
-    return popup
-      ? { popup: popup[1].split(',').map((s) => s.trim()).filter(Boolean), name, icon, title }
-      : { entity: target, name, icon };
-  }));
+  const buttons = $derived(parseButtons(props.buttons));
   const active = $derived(buttons.filter((b) => b.entity && isActive(ent(b.entity))).length);
 
   // Photo of the HA area, looked up once; an own image wins.
@@ -50,7 +54,8 @@
     send({ type: 'config/area_registry/list' }).then((list) => (areas = list)).catch(() => (areas = []));
   });
   const photo = $derived(t(props.image) || areas?.find((a) => a.area_id === props.area)?.picture || '');
-  const bg = $derived(photo ? (photo.startsWith('/') ? haImage(photo) : photo) : '');
+  // Absolute, because a relative url() in a CSS variable resolves against the stylesheet.
+  const bg = $derived(photo ? new URL(photo.startsWith('/') ? haImage(photo) : photo, location.href).href : '');
 
   const num = (id, unit, digits) => {
     const e = ent(id);
@@ -70,7 +75,10 @@
   function press(b) {
     if (b.popup) return void (app.popup = { cards: b.popup, title: b.title || b.name });
     const e = ent(b.entity);
-    if (e) toggle(e);
+    if (!e) return;
+    // A room button switches a TV or speaker on and off rather than play / pause.
+    if (e.entity_id.startsWith('media_player.')) callService('media_player', e.state === 'off' ? 'turn_on' : 'turn_off', {}, { entity_id: e.entity_id });
+    else toggle(e);
   }
   const narrow = $derived(w < 340);
 </script>
