@@ -5,7 +5,8 @@ import { svelte } from '@sveltejs/vite-plugin-svelte';
 export default defineConfig({
   base: './',
   plugins: [svelte()],
-  build: { target: 'es2022', cssCodeSplit: false },
+  // safari15: wall tablets often run an iPad stuck on iOS 15 (e.g. iPad Air 2).
+  build: { target: ['es2022', 'safari15'], cssCodeSplit: false },
   server: {
     proxy: {
       '/api': { target: 'http://localhost:8099', ws: true },
