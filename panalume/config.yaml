@@ -1,8 +1,8 @@
-name: Panalume
+name: Panalume (fork)
 version: "0.30.1"
 slug: panalume
 description: Glassy, fast, drag-and-drop Home Assistant dashboard — free layout, templated cards, Octopus energy cards
-url: https://github.com/leacho73/panalume
+url: https://github.com/StefaanBatsele/panalume
 arch:
   - aarch64
   - amd64
