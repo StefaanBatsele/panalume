@@ -17,7 +17,7 @@
       { key: 'icon', label: 'Icon', type: 'icon' },
       { key: 'area', label: 'HA area id for the background photo (e.g. living_room)', type: 'text' },
       { key: 'image', label: 'Own background photo URL (overrides the area photo)', type: 'text' },
-      { key: 'temperature', label: 'Temperature', type: 'entity', domain: 'sensor' },
+      { key: 'temperature', label: 'Temperature (sensor, or a thermostat: its measured temperature)', type: 'entity', domain: ['sensor', 'climate'] },
       { key: 'humidity', label: 'Humidity', type: 'entity', domain: 'sensor' },
       { key: 'power', label: 'Power', type: 'entity', domain: 'sensor' },
       // One button per line: "target | name | icon | popup title". The target is
@@ -59,8 +59,11 @@
 
   const num = (id, unit, digits) => {
     const e = ent(id);
-    const v = Number(e?.state);
-    return e && Number.isFinite(v) ? `${formatNumber(v, digits)} ${e.attributes.unit_of_measurement || unit}` : null;
+    // A thermostat's state is its mode; its reading is the current_temperature attribute.
+    const climate = e?.entity_id.startsWith('climate.');
+    const raw = climate ? e.attributes.current_temperature : e?.state;
+    const v = raw == null || raw === '' ? NaN : Number(raw);
+    return e && Number.isFinite(v) ? `${formatNumber(v, digits)} ${(climate ? e.attributes.temperature_unit : e.attributes.unit_of_measurement) || unit}` : null;
   };
   const climate = $derived([num(props.temperature, '°C', 1), num(props.humidity, '%', 1)].filter(Boolean));
   const power = $derived.by(() => {
