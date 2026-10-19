@@ -42,6 +42,20 @@
     return out.join(';');
   });
 
+  // A Home Assistant path (/dashboard/view) opened in the same tab navigates
+  // the HA window around our ingress iframe, not the iframe itself — so a
+  // kiosk without HA's sidebar can still get back to another dashboard.
+  function openUrl(url, newTab) {
+    if (!newTab && url.startsWith('/') && window.top !== window) {
+      try {
+        window.top.history.pushState(null, '', url);
+        window.top.dispatchEvent(new CustomEvent('location-changed', { detail: { replace: false } }));
+        return;
+      } catch { /* not the same origin: fall through */ }
+    }
+    window.open(url, newTab ? '_blank' : '_self');
+  }
+
   function run(which) {
     const meta = def?.meta || {};
     const act = card[which] || {};
@@ -64,7 +78,7 @@
     else if (kind === 'fullscreen' && entity) app.popup = { entity };
     else if (kind === 'popup') app.popup = { cards: act.cards || [], title: act.title };
     else if (kind === 'navigate' && act.view) setView(act.view);
-    else if (kind === 'url' && act.url) window.open(t(act.url), act.newTab === false ? '_self' : '_blank');
+    else if (kind === 'url' && act.url) openUrl(t(act.url), act.newTab !== false);
     else if (kind === 'service' && act.service) {
       const [d, sv] = act.service.split('.');
       let data = {};
